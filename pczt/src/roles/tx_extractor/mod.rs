@@ -99,8 +99,7 @@ impl<'a> TransactionExtractor<'a> {
         let lock_time = determine_lock_time(&pczt.global, &pczt.transparent.inputs)
             .ok_or(Error::IncompatibleLockTimes)?;
 
-        let transparent_bundle =
-            transparent::extract_bundle(pczt.transparent).map_err(Error::Transparent)?;
+        let transparent_bundle = transparent::extract_bundle(pczt.transparent).map_err(Error::Transparent)?;
         let sapling_bundle = sapling::extract_bundle(pczt.sapling).map_err(Error::Sapling)?;
         let orchard_bundle = orchard::extract_bundle(pczt.orchard).map_err(Error::Orchard)?;
 

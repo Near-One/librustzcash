@@ -4,21 +4,23 @@ use core2::io::Write;
 use ::transparent::{
     bundle::{self as transparent, TxOut},
     sighash::{
-        SIGHASH_ANYONECANPAY, SIGHASH_MASK, SIGHASH_NONE, SIGHASH_SINGLE,
-        TransparentAuthorizingContext,
+        TransparentAuthorizingContext, SIGHASH_ANYONECANPAY, SIGHASH_MASK, SIGHASH_NONE,
+        SIGHASH_SINGLE,
     },
 };
 use zcash_encoding::Array;
+use crate::transaction;
 
 use crate::{
     encoding::StateWrite,
     transaction::{
-        Authorization, TransactionData, TransparentDigests, TxDigests,
         sighash::SignableInput,
         txid::{
-            ZCASH_TRANSPARENT_HASH_PERSONALIZATION, hash_transparent_txid_data, to_hash,
-            transparent_outputs_hash, transparent_prevout_hash, transparent_sequence_hash,
+            hash_transparent_txid_data, to_hash, transparent_outputs_hash,
+            transparent_prevout_hash, transparent_sequence_hash,
+            ZCASH_TRANSPARENT_HASH_PERSONALIZATION,
         },
+        Authorization, TransactionData, TransparentDigests, TxDigests,
     },
 };
 
@@ -26,7 +28,7 @@ use crate::{
 use {
     crate::{
         encoding::WriteBytesExt,
-        transaction::{TzeDigests, components::tze},
+        transaction::{components::tze, TzeDigests},
     },
     zcash_encoding::{CompactSize, Vector},
 };
@@ -191,6 +193,43 @@ pub fn v5_signature_hash<
         txid_parts.header_digest,
         transparent_sig_digest(
             tx.transparent_bundle
+                .as_ref()
+                .zip(txid_parts.transparent_digests.as_ref()),
+            signable_input,
+        ),
+        txid_parts.sapling_digest,
+        txid_parts.orchard_digest,
+        #[cfg(zcash_unstable = "zfuture")]
+        tx.tze_bundle
+            .as_ref()
+            .zip(txid_parts.tze_digests.as_ref())
+            .map(|(bundle, tze_digests)| tze_input_sigdigests(bundle, signable_input, tze_digests))
+            .as_ref(),
+    )
+}
+
+pub fn my_signature_hash<
+    A: transaction::Authorization,
+    TA: TransparentAuthorizingContext,
+>(
+    tx: &TransactionData<A>,
+    transp_bundel: Option<transparent::Bundle<TA>>,
+    signable_input: &SignableInput<'_>,
+    txid_parts: &TxDigests<Blake2bHash>,
+) -> Blake2bHash {
+    // The caller must provide the transparent digests if and only if the transaction has a
+    // transparent component.
+    assert_eq!(
+        tx.transparent_bundle.is_some(),
+        txid_parts.transparent_digests.is_some()
+    );
+
+    to_hash(
+        tx.version,
+        tx.consensus_branch_id,
+        txid_parts.header_digest,
+        transparent_sig_digest(
+            transp_bundel
                 .as_ref()
                 .zip(txid_parts.transparent_digests.as_ref()),
             signable_input,

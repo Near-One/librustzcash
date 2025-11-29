@@ -7,6 +7,8 @@ use crate::{
     bundle::{Authorization, EffectsOnly, OutPoint, TxIn, TxOut},
     sighash::TransparentAuthorizingContext,
 };
+use zcash_script::script::{Component, Sig};
+use zcash_script::opcode::PushValue;
 
 use super::Input;
 
@@ -30,10 +32,7 @@ impl super::Bundle {
     pub fn extract(self) -> Result<Option<crate::bundle::Bundle<Unbound>>, TxExtractorError> {
         self.to_tx_data(
             |input| {
-                input
-                    .script_sig
-                    .clone()
-                    .ok_or(TxExtractorError::MissingScriptSig)
+                return Ok(Component::<PushValue>(vec![]));
             },
             |bundle| Ok(Unbound(effects_only(bundle))),
         )

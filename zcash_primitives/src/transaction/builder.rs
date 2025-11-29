@@ -4,21 +4,24 @@ use core::cmp::Ordering;
 use core::fmt;
 use rand::{CryptoRng, RngCore};
 
-use ::sapling::{Note, PaymentAddress, builder::SaplingMetadata};
+use ::sapling::{builder::SaplingMetadata, Note, PaymentAddress};
 use ::transparent::{address::TransparentAddress, builder::TransparentBuilder, bundle::TxOut};
 use zcash_protocol::{
     consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters},
     memo::MemoBytes,
     value::{BalanceError, ZatBalance, Zatoshis},
 };
+use crate::transaction::components::transparent::Bundle;
 
 use crate::transaction::{
-    Transaction, TxVersion,
     fees::{
-        FeeRule,
         transparent::{InputView, OutputView},
+        FeeRule,
     },
+    Transaction, TxVersion,
+    self,
 };
+use transparent::builder;
 
 #[cfg(feature = "std")]
 use std::sync::mpsc::Sender;
@@ -26,9 +29,9 @@ use std::sync::mpsc::Sender;
 #[cfg(feature = "circuits")]
 use {
     crate::transaction::{
-        TransactionData, Unauthorized,
-        sighash::{SignableInput, signature_hash},
+        sighash::{signature_hash, SignableInput},
         txid::TxIdDigester,
+        TransactionData, Unauthorized,
     },
     ::sapling::prover::{OutputProver, SpendProver},
     ::transparent::builder::TransparentSigningSet,
@@ -390,7 +393,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
             params,
             build_config,
             target_height,
-            expiry_height: target_height + DEFAULT_TX_EXPIRY_DELTA,
+            expiry_height: 0.into(),//target_height + DEFAULT_TX_EXPIRY_DELTA,
             #[cfg(all(
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
@@ -718,6 +721,49 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         )
     }
 
+    /*pub fn get_unath_tx<R: RngCore + CryptoRng>(&self, mut rng: R) -> TransactionData<Unauthorized> {
+        let consensus_branch_id = BranchId::for_height(&self.params, self.target_height);
+
+        // determine transaction version
+        let version = TxVersion::suggested_for_branch(consensus_branch_id);
+        let transparent_bundle = self.transparent_builder.clone().build();
+
+        let (orchard_bundle, orchard_meta) = match self
+            .orchard_builder
+            .and_then(|builder| {
+                builder
+                    .build(&mut rng)
+                    .map_err(Error::<&str>::OrchardBuild)
+                    .transpose()
+            })
+            .transpose().clone().unwrap()
+        {
+            Some((bundle, meta)) => (Some(bundle), meta),
+            None => (None, orchard::builder::BundleMetadata::empty()),
+        };
+
+
+        let unauthed_tx: TransactionData<Unauthorized> = TransactionData {
+            version,
+            consensus_branch_id: BranchId::for_height(&self.params, self.target_height),
+            lock_time: 0,
+            expiry_height: 0.into(), //self.expiry_height,
+            #[cfg(all(
+                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
+                feature = "zip-233"
+            ))]
+            zip233_amount: self.zip233_amount,
+            transparent_bundle,
+            sprout_bundle: None,
+            sapling_bundle: None,
+            orchard_bundle,
+            #[cfg(zcash_unstable = "zfuture")]
+            tze_bundle,
+        };
+
+        unauthed_tx
+    }*/
+
     /// Builds a transaction from the configured spends and outputs.
     ///
     /// Upon success, returns a tuple containing the final transaction, and the
@@ -837,7 +883,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             version,
             consensus_branch_id: BranchId::for_height(&self.params, self.target_height),
             lock_time: 0,
-            expiry_height: self.expiry_height,
+            expiry_height: 0.into(),//self.expiry_height,
             #[cfg(all(
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
@@ -899,6 +945,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             .transpose()
             .map_err(Error::SaplingBuild)?;
 
+        panic!("SIGHASH: {:?}", shielded_sig_commitment.as_ref());
         let orchard_bundle = unauthed_tx
             .orchard_bundle
             .map(|b| {
@@ -941,6 +988,10 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         })
     }
 
+    pub fn get_transp_bundel(self) -> Option<Bundle<builder::Unauthorized>> {
+        self.transparent_builder.build()
+    }
+
     /// Builds a PCZT from the configured spends and outputs.
     ///
     /// Upon success, returns a struct containing the PCZT components, and the
@@ -970,9 +1021,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
             Ordering::Less => {
                 return Err(Error::InsufficientFunds(-balance_after_fees));
             }
-            Ordering::Greater => {
-                return Err(Error::ChangeRequired(balance_after_fees));
-            }
+            Ordering::Greater => (),
             Ordering::Equal => (),
         };
 
@@ -1010,7 +1059,7 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
                 version,
                 consensus_branch_id,
                 lock_time: 0,
-                expiry_height: self.expiry_height,
+                expiry_height: 0.into(),//self.expiry_height,
                 transparent: transparent_bundle,
                 sapling: sapling_bundle,
                 orchard: orchard_bundle,
@@ -1123,7 +1172,7 @@ mod tests {
     use super::{Builder, Error};
     use crate::transaction::builder::BuildConfig;
 
-    use ::sapling::{Node, Rseed, zip32::ExtendedSpendingKey};
+    use ::sapling::{zip32::ExtendedSpendingKey, Node, Rseed};
     use ::transparent::{address::TransparentAddress, builder::TransparentSigningSet};
     use zcash_protocol::{
         consensus::{NetworkUpgrade, Parameters, TEST_NETWORK},
@@ -1137,7 +1186,7 @@ mod tests {
 
     #[cfg(feature = "transparent-inputs")]
     use {
-        crate::transaction::{OutPoint, TxOut, builder::DEFAULT_TX_EXPIRY_DELTA},
+        crate::transaction::{builder::DEFAULT_TX_EXPIRY_DELTA, OutPoint, TxOut},
         ::transparent::keys::{AccountPrivKey, IncomingViewingKey},
         zip32::AccountId,
     };
@@ -1163,7 +1212,7 @@ mod tests {
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             },
             target_height: sapling_activation_height,
-            expiry_height: sapling_activation_height + DEFAULT_TX_EXPIRY_DELTA,
+            expiry_height: 0.into(),//sapling_activation_height + DEFAULT_TX_EXPIRY_DELTA,
             #[cfg(all(
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
