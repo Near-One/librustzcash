@@ -5,13 +5,12 @@ use core::fmt;
 use rand::{CryptoRng, RngCore};
 
 use ::sapling::{builder::SaplingMetadata, Note, PaymentAddress};
-use ::transparent::{address::TransparentAddress, builder::TransparentBuilder, bundle::TxOut};
+use ::transparent::{address::TransparentAddress, builder::TransparentBuilder, bundle::TxOut, bundle::Bundle};
 use zcash_protocol::{
     consensus::{self, BlockHeight, BranchId, NetworkUpgrade, Parameters},
     memo::MemoBytes,
     value::{BalanceError, ZatBalance, Zatoshis},
 };
-use crate::transaction::components::transparent::Bundle;
 
 use crate::transaction::{
     fees::{
