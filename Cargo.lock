@@ -1979,9 +1979,9 @@ dependencies = [
 
 [[package]]
 name = "halo2_gadgets"
-version = "0.3.1"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73a5e510d58a07d8ed238a5a8a436fe6c2c79e1bb2611f62688bc65007b4e6e7"
+checksum = "45824ce0dd12e91ec0c68ebae2a7ed8ae19b70946624c849add59f1d1a62a143"
 dependencies = [
  "arrayvec",
  "bitvec",
@@ -2928,8 +2928,8 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "orchard"
-version = "0.11.0"
-source = "git+https://github.com/Near-One/orchard?rev=a343552ea2ec90365481da4755a720ce2ace525b#a343552ea2ec90365481da4755a720ce2ace525b"
+version = "0.12.0"
+source = "git+https://github.com/Near-One/orchard?rev=a43977f07e6fdadff214bb081a481756a28b41fc#a43977f07e6fdadff214bb081a481756a28b41fc"
 dependencies = [
  "aes",
  "bitvec",
@@ -2950,6 +2950,7 @@ dependencies = [
  "pasta_curves",
  "proptest",
  "rand 0.8.5",
+ "rand_core 0.6.4",
  "reddsa",
  "serde",
  "sinsemilla",
