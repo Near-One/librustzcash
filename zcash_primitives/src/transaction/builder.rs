@@ -59,7 +59,7 @@ use super::components::sapling::zip212_enforcement;
 
 /// Since Blossom activation, the default transaction expiry delta should be 40 blocks.
 /// <https://zips.z.cash/zip-0203#changes-for-blossom>
-pub const DEFAULT_TX_EXPIRY_DELTA: u32 = 1000;
+pub const DEFAULT_TX_EXPIRY_DELTA: u32 = 50;
 
 /// Errors that can occur during fee calculation.
 #[derive(Debug)]
@@ -369,7 +369,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
     ///
     /// The expiry height will be set to the given height plus the default transaction
     /// expiry delta (20 blocks).
-    pub fn new(params: P, target_height: BlockHeight, build_config: BuildConfig) -> Self {
+    pub fn new(params: P, target_height: BlockHeight, expiry_delta: u32, build_config: BuildConfig) -> Self {
         let orchard_builder = if params.is_nu_active(NetworkUpgrade::Nu5, target_height) {
             build_config
                 .orchard_builder_config()
@@ -392,7 +392,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
             params,
             build_config,
             target_height,
-            expiry_height: target_height + DEFAULT_TX_EXPIRY_DELTA,
+            expiry_height: target_height + expiry_delta,
             #[cfg(all(
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
