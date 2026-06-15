@@ -32,7 +32,7 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
     ShieldedProtocol, TxId,
-    consensus::{self, BlockHeight, NetworkUpgrade},
+    consensus::{self, BlockHeight, NetworkUpgrade, TxIndex},
 };
 use zip32::{Scope, fingerprint::SeedFingerprint};
 
@@ -286,6 +286,74 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         ))
     }
 
+    /// Returns the wallet account that most likely funded the transaction with the
+    /// given txid, based on the wallet's stored spend records (across transparent,
+    /// sapling, and orchard pools), if any. If multiple wallet accounts contributed
+    /// inputs to the transaction, the account that contributed the most value is
+    /// selected; ties are broken in favor of the account whose oldest contributed
+    /// input has the lowest mined height (with unmined inputs sorting last).
+    ///
+    /// `zcash_client_backend` does not currently support representing multiple
+    /// funding accounts on a single output; this heuristic provides a deterministic
+    /// single-account choice when more than one wallet account contributed funds.
+    pub(crate) fn find_funding_account(&self, creating_txid: &TxId) -> Option<AccountId> {
+        // Per-account: (total_value, oldest_mined_height).
+        let mut contribs: std::collections::BTreeMap<AccountId, (u64, BlockHeight)> =
+            std::collections::BTreeMap::new();
+
+        let mut record = |account_id: AccountId, value: u64, source_txid: &TxId| {
+            let mined = self
+                .tx_table
+                .get_transaction(source_txid)
+                .and_then(|tx| tx.mined_height())
+                .unwrap_or(BlockHeight::from_u32(u32::MAX));
+            contribs
+                .entry(account_id)
+                .and_modify(|(v, h)| {
+                    *v += value;
+                    if mined < *h {
+                        *h = mined;
+                    }
+                })
+                .or_insert((value, mined));
+        };
+
+        #[cfg(feature = "transparent-inputs")]
+        for (outpoint, spending_txid) in self.transparent_received_output_spends.iter() {
+            if spending_txid == creating_txid {
+                if let Some(received) = self.transparent_received_outputs.get(outpoint) {
+                    record(
+                        received.account_id,
+                        u64::from(received.txout.value()),
+                        &received.transaction_id,
+                    );
+                }
+            }
+        }
+
+        for (note_id, spending_txid) in self.received_note_spends.iter() {
+            if spending_txid == creating_txid {
+                if let Some(received) = self.received_notes.iter().find(|n| &n.note_id == note_id) {
+                    record(
+                        received.account_id,
+                        received.note.value().into_u64(),
+                        &received.txid,
+                    );
+                }
+            }
+        }
+
+        contribs
+            .into_iter()
+            .max_by(|(a_id, (a_v, a_h)), (b_id, (b_v, b_h))| {
+                // Highest value first; older (lower) mined height first; account id ascending.
+                a_v.cmp(b_v)
+                    .then_with(|| b_h.cmp(a_h))
+                    .then_with(|| b_id.cmp(a_id))
+            })
+            .map(|(id, _)| id)
+    }
+
     pub(crate) fn get_funding_accounts(
         &self,
         tx: &Transaction,
@@ -516,8 +584,8 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     ) -> Result<Option<zip32::AccountId>, Error> {
         Ok(self
             .accounts
-            .iter()
-            .filter_map(|(_, a)| match a.source() {
+            .values()
+            .filter_map(|a| match a.source() {
                 AccountSource::Derived { derivation, .. } => {
                     if derivation.seed_fingerprint() == seed_fingerprint {
                         Some(derivation.account_index())
@@ -557,14 +625,14 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     pub(crate) fn insert_sapling_nullifier_map(
         &mut self,
         block_height: BlockHeight,
-        new_entries: &[(TxId, u16, Vec<sapling::Nullifier>)],
+        new_entries: &[(TxIndex, TxId, Vec<sapling::Nullifier>)],
     ) -> Result<(), Error> {
-        for (txid, tx_index, nullifiers) in new_entries {
+        for (tx_index, txid, nullifiers) in new_entries {
             for nf in nullifiers.iter() {
                 self.nullifiers
-                    .insert(block_height, *tx_index as u32, Nullifier::Sapling(*nf));
+                    .insert(block_height, u32::from(*tx_index), Nullifier::Sapling(*nf));
             }
-            match self.tx_locator.entry((block_height, *tx_index as u32)) {
+            match self.tx_locator.entry((block_height, u32::from(*tx_index))) {
                 Entry::Occupied(x) => {
                     if txid == x.get() {
                         // This is a duplicate entry
@@ -585,14 +653,14 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     pub(crate) fn insert_orchard_nullifier_map(
         &mut self,
         block_height: BlockHeight,
-        new_entries: &[(TxId, u16, Vec<orchard::note::Nullifier>)],
+        new_entries: &[(TxIndex, TxId, Vec<orchard::note::Nullifier>)],
     ) -> Result<(), Error> {
-        for (txid, tx_index, nullifiers) in new_entries {
+        for (tx_index, txid, nullifiers) in new_entries {
             for nf in nullifiers.iter() {
                 self.nullifiers
-                    .insert(block_height, *tx_index as u32, Nullifier::Orchard(*nf));
+                    .insert(block_height, u32::from(*tx_index), Nullifier::Orchard(*nf));
             }
-            match self.tx_locator.entry((block_height, *tx_index as u32)) {
+            match self.tx_locator.entry((block_height, u32::from(*tx_index))) {
                 Entry::Occupied(x) => {
                     if txid == x.get() {
                         // This is a duplicate entry
@@ -873,14 +941,17 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 .fold(0, |sum, (_, block)| {
                     sum + block.sapling_output_count.unwrap_or(0)
                 });
-            Ok(Some(Ratio::new(outputs_sum as u64, outputs_sum as u64)))
+            Ok(Some(Ratio::new(
+                u64::from(outputs_sum),
+                u64::from(outputs_sum),
+            )))
         } else {
             // Get the starting note commitment tree size from the wallet birthday, or failing that
             // from the blocks table.
             let start_size = self
                 .accounts
-                .iter()
-                .filter_map(|(_, account)| {
+                .values()
+                .filter_map(|account| {
                     if account.birthday().height() == *birthday_height {
                         Some(account.birthday().sapling_frontier().tree_size())
                     } else {
@@ -893,9 +964,10 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                         .iter()
                         .filter(|(height, _)| height <= &birthday_height)
                         .map(|(_, block)| {
-                            (block.sapling_commitment_tree_size.unwrap_or(0)
-                                - block.sapling_output_count.unwrap_or(0))
-                                as u64
+                            u64::from(
+                                block.sapling_commitment_tree_size.unwrap_or(0)
+                                    - block.sapling_output_count.unwrap_or(0),
+                            )
                         })
                         .max()
                 });
@@ -906,7 +978,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 .iter()
                 .filter(|(height, _)| height > &birthday_height)
                 .fold(0_u64, |acc, (_, block)| {
-                    acc + block.sapling_output_count.unwrap_or(0) as u64
+                    acc + u64::from(block.sapling_output_count.unwrap_or(0))
                 });
 
             // We don't have complete information on how many outputs will exist in the shard at
@@ -951,14 +1023,17 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 .fold(0, |sum, (_, block)| {
                     sum + block.orchard_action_count.unwrap_or(0)
                 });
-            Ok(Some(Ratio::new(outputs_sum as u64, outputs_sum as u64)))
+            Ok(Some(Ratio::new(
+                u64::from(outputs_sum),
+                u64::from(outputs_sum),
+            )))
         } else {
             // Get the starting note commitment tree size from the wallet birthday, or failing that
             // from the blocks table.
             let start_size = self
                 .accounts
-                .iter()
-                .filter_map(|(_, account)| {
+                .values()
+                .filter_map(|account| {
                     if account.birthday().height() == *birthday_height {
                         Some(account.birthday().sapling_frontier().tree_size())
                     } else {
@@ -971,9 +1046,10 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                         .iter()
                         .filter(|(height, _)| height <= &birthday_height)
                         .map(|(_, block)| {
-                            (block.orchard_commitment_tree_size.unwrap_or(0)
-                                - block.orchard_action_count.unwrap_or(0))
-                                as u64
+                            u64::from(
+                                block.orchard_commitment_tree_size.unwrap_or(0)
+                                    - block.orchard_action_count.unwrap_or(0),
+                            )
                         })
                         .max()
                 });
@@ -984,7 +1060,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 .iter()
                 .filter(|(height, _)| height > &birthday_height)
                 .fold(0_u64, |acc, (_, block)| {
-                    acc + block.orchard_action_count.unwrap_or(0) as u64
+                    acc + u64::from(block.orchard_action_count.unwrap_or(0))
                 });
 
             // We don't have complete information on how many outputs will exist in the shard at
@@ -1041,7 +1117,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     #[allow(unreachable_code, unused_variables)] //FIXME: need address key scope detection
     pub(crate) fn put_transparent_output(
         &mut self,
-        output: &WalletTransparentOutput,
+        output: &WalletTransparentOutput<AccountId>,
         receiving_account: &AccountId,
         known_unspent: bool,
     ) -> Result<OutPoint, Error> {

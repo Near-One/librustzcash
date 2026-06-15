@@ -8,19 +8,18 @@ use orchard::{
 use rusqlite::{Connection, Row, named_params, types::Value};
 
 use zcash_client_backend::{
-    DecryptedOutput, TransferType,
     data_api::{
         Account as _, NullifierQuery, TargetValue,
+        ll::ReceivedOrchardOutput,
         wallet::{ConfirmationsPolicy, TargetHeight},
     },
-    wallet::{ReceivedNote, WalletOrchardOutput},
+    wallet::ReceivedNote,
 };
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::{
     ShieldedProtocol,
     consensus::{self, BlockHeight},
-    memo::MemoBytes,
 };
 use zip32::Scope;
 
@@ -29,82 +28,6 @@ use crate::{AccountRef, AccountUuid, AddressRef, ReceivedNoteId, TxRef, error::S
 use super::{
     KeyScope, common::UnspentNoteMeta, get_account, get_account_ref, memo_repr, upsert_address,
 };
-
-/// This trait provides a generalization over shielded output representations.
-pub(crate) trait ReceivedOrchardOutput {
-    type AccountId;
-
-    fn index(&self) -> usize;
-    fn account_id(&self) -> Self::AccountId;
-    fn note(&self) -> &Note;
-    fn memo(&self) -> Option<&MemoBytes>;
-    fn is_change(&self) -> bool;
-    fn nullifier(&self) -> Option<&Nullifier>;
-    fn note_commitment_tree_position(&self) -> Option<Position>;
-    fn recipient_key_scope(&self) -> Option<Scope>;
-}
-
-impl<AccountId: Copy> ReceivedOrchardOutput for WalletOrchardOutput<AccountId> {
-    type AccountId = AccountId;
-
-    fn index(&self) -> usize {
-        self.index()
-    }
-    fn account_id(&self) -> Self::AccountId {
-        *WalletOrchardOutput::account_id(self)
-    }
-    fn note(&self) -> &Note {
-        WalletOrchardOutput::note(self)
-    }
-    fn memo(&self) -> Option<&MemoBytes> {
-        None
-    }
-    fn is_change(&self) -> bool {
-        WalletOrchardOutput::is_change(self)
-    }
-    fn nullifier(&self) -> Option<&Nullifier> {
-        self.nf()
-    }
-    fn note_commitment_tree_position(&self) -> Option<Position> {
-        Some(WalletOrchardOutput::note_commitment_tree_position(self))
-    }
-    fn recipient_key_scope(&self) -> Option<Scope> {
-        self.recipient_key_scope()
-    }
-}
-
-impl<AccountId: Copy> ReceivedOrchardOutput for DecryptedOutput<Note, AccountId> {
-    type AccountId = AccountId;
-
-    fn index(&self) -> usize {
-        self.index()
-    }
-    fn account_id(&self) -> Self::AccountId {
-        *self.account()
-    }
-    fn note(&self) -> &orchard::note::Note {
-        self.note()
-    }
-    fn memo(&self) -> Option<&MemoBytes> {
-        Some(self.memo())
-    }
-    fn is_change(&self) -> bool {
-        self.transfer_type() == TransferType::WalletInternal
-    }
-    fn nullifier(&self) -> Option<&Nullifier> {
-        None
-    }
-    fn note_commitment_tree_position(&self) -> Option<Position> {
-        None
-    }
-    fn recipient_key_scope(&self) -> Option<Scope> {
-        if self.transfer_type() == TransferType::WalletInternal {
-            Some(Scope::Internal)
-        } else {
-            Some(Scope::External)
-        }
-    }
-}
 
 pub(crate) fn to_received_note<P: consensus::Parameters>(
     params: &P,
@@ -244,6 +167,74 @@ pub(crate) fn select_spendable_orchard_notes<P: consensus::Parameters>(
     )
 }
 
+/// Return all Orchard notes that were received at or before `height`
+/// and unspent as of `height`, for the given account.
+///
+/// Unlike `select_spendable_notes` (which applies confirmation, dust, and
+/// expiry filters for transaction construction), this returns every note
+/// that existed and was unspent at the given height.
+///
+/// Height filtering uses `transactions.mined_height`, not `transactions.block`.
+/// A transaction is considered to have occurred at its mined height as soon
+/// as the wallet learns of that height (for example, from transparent UTXO
+/// retrieval), even if the containing compact block has not been fully
+/// scanned. In practice the two columns are equivalent for the notes this
+/// query can return, because `nf IS NOT NULL` and
+/// `commitment_tree_position IS NOT NULL` already require a scan of the
+/// block that contains the receiving transaction.
+///
+/// This function does not verify that a Merkle witness can be constructed
+/// for each returned note at `height`. Witness construction is a separate
+/// concern intended to be handled by the callers. As an example, a companion
+/// `WalletDb::generate_orchard_witnesses_at_historical_height` returns an
+/// actionable error for any position the wallet cannot witness at `height`
+/// (for example, because the wallet has not synced through `height`, the checkpoint was pruned,
+/// or the position does not belong to the wallet).
+pub(crate) fn get_unspent_orchard_notes_at_historical_height<P: consensus::Parameters>(
+    conn: &Connection,
+    params: &P,
+    account: AccountUuid,
+    height: BlockHeight,
+) -> Result<Vec<ReceivedNote<ReceivedNoteId, Note>>, SqliteClientError> {
+    let external_scope = KeyScope::EXTERNAL.encode();
+    let internal_scope = KeyScope::INTERNAL.encode();
+
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT
+             rn.id AS id, t.txid, rn.action_index,
+             rn.diversifier, rn.value, rn.rho, rn.rseed, rn.commitment_tree_position,
+             accounts.ufvk AS ufvk, rn.recipient_key_scope,
+             t.mined_height,
+             NULL AS max_shielding_input_height
+         FROM orchard_received_notes rn
+         INNER JOIN accounts ON accounts.id = rn.account_id
+         INNER JOIN transactions t ON t.id_tx = rn.transaction_id
+         WHERE accounts.uuid = :account_uuid
+           AND t.mined_height <= :height
+           AND rn.nf IS NOT NULL
+           AND rn.commitment_tree_position IS NOT NULL
+           AND rn.recipient_key_scope IN ({external_scope}, {internal_scope})
+           AND accounts.ufvk IS NOT NULL
+           AND rn.id NOT IN (
+               SELECT rns.orchard_received_note_id
+               FROM orchard_received_note_spends rns
+               JOIN transactions t_spend ON t_spend.id_tx = rns.transaction_id
+               WHERE t_spend.mined_height <= :height
+           )
+         ORDER BY rn.commitment_tree_position",
+    ))?;
+
+    let rows = stmt.query_and_then(
+        named_params![
+            ":account_uuid": account.0,
+            ":height": u32::from(height),
+        ],
+        |row| to_received_note(params, row),
+    )?;
+
+    rows.filter_map(|r| r.transpose()).collect()
+}
+
 pub(crate) fn ensure_address<
     T: ReceivedOrchardOutput<AccountId = AccountUuid>,
     P: consensus::Parameters,
@@ -381,6 +372,7 @@ pub(crate) fn put_received_note<
             ],
         )?;
     }
+
     Ok(account_id)
 }
 
@@ -439,16 +431,45 @@ pub(crate) fn mark_orchard_note_spent(
     tx_ref: TxRef,
     nf: &Nullifier,
 ) -> Result<bool, SqliteClientError> {
+    let sql_params = named_params![
+       ":nf": nf.to_bytes(),
+       ":transaction_id": tx_ref.0
+    ];
+    let has_collision = conn.query_row(
+        "WITH possible_conflicts AS (
+            SELECT s.transaction_id
+            FROM orchard_received_notes n
+            JOIN orchard_received_note_spends s ON s.orchard_received_note_id = n.id
+            JOIN transactions t ON t.id_tx = s.transaction_id
+            WHERE n.nf = :nf
+            AND t.id_tx != :transaction_id
+            AND t.mined_height IS NOT NULL
+        ),
+        mined_tx AS (
+            SELECT t.id_tx AS transaction_id
+            FROM transactions t
+            WHERE t.id_tx = :transaction_id
+            AND t.mined_height IS NOT NULL
+        )
+        SELECT EXISTS(SELECT 1 FROM possible_conflicts) AND EXISTS(SELECT 1 FROM mined_tx)",
+        sql_params,
+        |row| row.get::<_, bool>(0),
+    )?;
+
+    if has_collision {
+        return Err(SqliteClientError::CorruptedData(format!(
+            "A different mined transaction revealing Orchard nullifier {} already exists",
+            hex::encode(nf.to_bytes())
+        )));
+    }
+
     let mut stmt_mark_orchard_note_spent = conn.prepare_cached(
         "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
          SELECT id, :transaction_id FROM orchard_received_notes WHERE nf = :nf
          ON CONFLICT (orchard_received_note_id, transaction_id) DO NOTHING",
     )?;
 
-    match stmt_mark_orchard_note_spent.execute(named_params![
-       ":nf": nf.to_bytes(),
-       ":transaction_id": tx_ref.0
-    ])? {
+    match stmt_mark_orchard_note_spent.execute(sql_params)? {
         0 => Ok(false),
         1 => Ok(true),
         _ => unreachable!("nf column is marked as UNIQUE"),
@@ -467,6 +488,11 @@ pub(crate) mod tests {
     #[test]
     fn send_single_step_proposed_transfer() {
         testing::pool::send_single_step_proposed_transfer::<OrchardPoolTester>()
+    }
+
+    #[test]
+    fn scan_full_block_detects_outputs() {
+        testing::pool::scan_full_block_detects_outputs::<OrchardPoolTester>()
     }
 
     #[test]
@@ -671,5 +697,135 @@ pub(crate) mod tests {
     #[test]
     fn receive_two_notes_with_same_value() {
         testing::pool::receive_two_notes_with_same_value::<OrchardPoolTester>();
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn immature_coinbase_outputs_are_excluded_from_note_selection() {
+        testing::pool::immature_coinbase_outputs_are_excluded_from_note_selection::<
+            OrchardPoolTester,
+        >();
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn coinbase_only_filtering() {
+        testing::pool::coinbase_only_filtering::<OrchardPoolTester>();
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn propose_shielding_coinbase_succeeds() {
+        testing::pool::propose_shielding_coinbase_succeeds::<OrchardPoolTester>();
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn propose_shielding_coinbase_transparent_recipient_rejected() {
+        testing::pool::propose_shielding_coinbase_transparent_recipient_rejected::<OrchardPoolTester>(
+        );
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn propose_shielding_coinbase_with_memo_succeeds() {
+        testing::pool::propose_shielding_coinbase_with_memo_succeeds::<OrchardPoolTester>();
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn propose_shielding_coinbase_with_limit_truncates_inputs() {
+        testing::pool::propose_shielding_coinbase_with_limit_truncates_inputs::<OrchardPoolTester>(
+        );
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn propose_shielding_coinbase_with_zero_limit_insufficient_funds() {
+        testing::pool::propose_shielding_coinbase_with_zero_limit_insufficient_funds::<
+            OrchardPoolTester,
+        >();
+    }
+
+    #[cfg(all(feature = "pczt-tests", feature = "transparent-inputs"))]
+    #[test]
+    fn propose_and_build_shielding_coinbase_succeeds() {
+        testing::pool::propose_and_build_shielding_coinbase_succeeds::<OrchardPoolTester>();
+    }
+
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn get_unspent_orchard_notes_at_historical_height_boundary_heights() {
+        use zcash_client_backend::data_api::Account;
+        use zcash_client_backend::data_api::testing::{
+            AddressType, TestBuilder, pool::ShieldedPoolTester,
+        };
+        use zcash_primitives::block::BlockHash;
+        use zcash_protocol::value::Zatoshis;
+
+        use crate::testing::{BlockCache, db::TestDbFactory};
+
+        let mut st = TestBuilder::new()
+            .with_data_store_factory(TestDbFactory::default())
+            .with_block_cache(BlockCache::new())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build();
+
+        let account = st.test_account().cloned().unwrap();
+        let dfvk = OrchardPoolTester::test_account_fvk(&st);
+
+        // Receive a note at h1
+        let value = Zatoshis::const_from_u64(50000);
+        let (h1, _, nf) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value);
+        st.scan_cached_blocks(h1, 1);
+
+        // Spend that note at h2 (produces change back to us)
+        let not_our_key = OrchardPoolTester::sk_to_fvk(&OrchardPoolTester::sk(&[0xf5; 32]));
+        let to = OrchardPoolTester::fvk_default_address(&not_our_key);
+        let spend_value = Zatoshis::const_from_u64(20000);
+        let (h2, _) = st.generate_next_block_spending(&dfvk, (nf, value), to, spend_value);
+        st.scan_cached_blocks(h2, 1);
+
+        // Receive another note at h3
+        let value3 = Zatoshis::const_from_u64(70000);
+        let (h3, _, _) = st.generate_next_block(&dfvk, AddressType::DefaultExternal, value3);
+        st.scan_cached_blocks(h3, 1);
+
+        let db = st.wallet().db();
+
+        // Before any notes: nothing (h1 - 1 is before the note was mined)
+        let notes = db
+            .get_unspent_orchard_notes_at_historical_height(account.id(), h1 - 1)
+            .unwrap();
+        assert_eq!(notes.len(), 0);
+
+        // At h1: original note received and unspent
+        let notes = db
+            .get_unspent_orchard_notes_at_historical_height(account.id(), h1)
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].note_value().unwrap(), value);
+
+        // At h2: original spent, only change note remains
+        let notes = db
+            .get_unspent_orchard_notes_at_historical_height(account.id(), h2)
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].note_value().unwrap(),
+            (value - spend_value).unwrap()
+        );
+
+        // At h3: change note + new note
+        let notes = db
+            .get_unspent_orchard_notes_at_historical_height(account.id(), h3)
+            .unwrap();
+        assert_eq!(notes.len(), 2);
+        let total: Zatoshis = notes
+            .iter()
+            .map(|n| n.note_value().unwrap())
+            .sum::<Option<Zatoshis>>()
+            .unwrap();
+        assert_eq!(total, ((value - spend_value).unwrap() + value3).unwrap());
     }
 }

@@ -4,7 +4,10 @@ use rand_chacha::ChaChaRng;
 use rusqlite::Connection;
 use std::num::NonZeroU32;
 use std::time::Duration;
-use std::{collections::HashMap, time::SystemTime};
+use std::{
+    collections::{HashMap, HashSet},
+    time::SystemTime,
+};
 use uuid::Uuid;
 
 use tempfile::NamedTempFile;
@@ -17,6 +20,7 @@ use zcash_client_backend::{
     data_api::{
         TargetValue,
         chain::{ChainState, CommitmentTreeRoot},
+        error::RewindError,
         scanning::ScanRange,
         testing::{DataStoreFactory, Reset, TestState},
         wallet::{ConfirmationsPolicy, TargetHeight},
@@ -33,7 +37,7 @@ use zcash_primitives::{
     transaction::{Transaction, TxId},
 };
 use zcash_protocol::{
-    ShieldedProtocol, consensus::BlockHeight, local_consensus::LocalNetwork, memo::Memo,
+    ShieldedProtocol, consensus, consensus::BlockHeight, local_consensus::LocalNetwork, memo::Memo,
 };
 use zip32::DiversifierIndex;
 
@@ -45,13 +49,9 @@ use crate::{
 #[cfg(feature = "transparent-inputs")]
 use {
     crate::TransparentAddressMetadata,
-    ::transparent::{
-        address::TransparentAddress,
-        bundle::OutPoint,
-        keys::{NonHardenedChildIndex, TransparentKeyScope},
-    },
+    ::transparent::{address::TransparentAddress, bundle::OutPoint, keys::NonHardenedChildIndex},
     core::ops::Range,
-    testing::transparent::GapLimits,
+    zcash_keys::keys::transparent::gap_limits::GapLimits,
 };
 
 /// Tuesday, 25 February 2025 00:00:00Z (the day the clock code was added).
@@ -195,7 +195,7 @@ impl DataStoreFactory for TestDbFactory {
             WalletDb::for_path(data_file.path(), network, test_clock(), test_rng()).unwrap();
         #[cfg(feature = "transparent-inputs")]
         if let Some(gap_limits) = gap_limits {
-            db_data = db_data.with_gap_limits(gap_limits.into());
+            db_data = db_data.with_gap_limits(gap_limits);
         }
 
         let migrator = WalletMigrator::new();
@@ -225,7 +225,7 @@ impl Reset for TestDb {
                 .new_data_store(
                     network,
                     #[cfg(feature = "transparent-inputs")]
-                    Some(gap_limits.into()),
+                    Some(gap_limits),
                 )
                 .unwrap(),
         );
