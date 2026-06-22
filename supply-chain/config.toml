@@ -212,7 +212,7 @@ version = "0.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.block-buffer]]
-version = "0.11.0-rc.3"
+version = "0.11.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.bls12_381]]
@@ -332,7 +332,7 @@ version = "0.5.5"
 criteria = "safe-to-deploy"
 
 [[exemptions.crypto-common]]
-version = "0.2.0-rc.1"
+version = "0.2.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.ctr]]
@@ -652,7 +652,7 @@ version = "1.1.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.hybrid-array]]
-version = "0.2.3"
+version = "0.4.12"
 criteria = "safe-to-deploy"
 
 [[exemptions.hyper]]
@@ -1532,7 +1532,7 @@ version = "3.3.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.typenum]]
-version = "1.17.0"
+version = "1.20.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.uint]]
