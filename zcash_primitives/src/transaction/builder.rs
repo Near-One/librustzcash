@@ -367,7 +367,12 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
     ///
     /// The expiry height will be set to the given height plus the default transaction
     /// expiry delta (20 blocks).
-    pub fn new(params: P, target_height: BlockHeight, build_config: BuildConfig) -> Self {
+    pub fn new(
+        params: P,
+        target_height: BlockHeight,
+        expiry_delta: u32,
+        build_config: BuildConfig,
+    ) -> Self {
         let orchard_builder = if params.is_nu_active(NetworkUpgrade::Nu5, target_height) {
             build_config
                 .orchard_builder_config()
@@ -390,7 +395,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
             params,
             build_config,
             target_height,
-            expiry_height: target_height + DEFAULT_TX_EXPIRY_DELTA,
+            expiry_height: target_height + expiry_delta,
             #[cfg(all(
                 any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
                 feature = "zip-233"
@@ -941,6 +946,12 @@ impl<P: consensus::Parameters, U: sapling::builder::ProverProgress> Builder<'_, 
         })
     }
 
+    pub fn get_transp_bundel(
+        self,
+    ) -> Option<::transparent::bundle::Bundle<::transparent::builder::Unauthorized>> {
+        self.transparent_builder.build()
+    }
+
     /// Builds a PCZT from the configured spends and outputs.
     ///
     /// Upon success, returns a struct containing the PCZT components, and the
@@ -1120,7 +1131,7 @@ mod tests {
     use incrementalmerkletree::{frontier::CommitmentTree, witness::IncrementalWitness};
     use rand_core::OsRng;
 
-    use super::{Builder, Error};
+    use super::{Builder, DEFAULT_TX_EXPIRY_DELTA, Error};
     use crate::transaction::builder::BuildConfig;
 
     use ::sapling::{Node, Rseed, zip32::ExtendedSpendingKey};
@@ -1137,7 +1148,7 @@ mod tests {
 
     #[cfg(feature = "transparent-inputs")]
     use {
-        crate::transaction::{OutPoint, TxOut, builder::DEFAULT_TX_EXPIRY_DELTA},
+        crate::transaction::{OutPoint, TxOut},
         ::transparent::keys::{AccountPrivKey, IncomingViewingKey},
         zip32::AccountId,
     };
@@ -1239,7 +1250,7 @@ mod tests {
             sapling_anchor: Some(witness1.root().into()),
             orchard_anchor: None,
         };
-        let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+        let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
 
         // Create a tx with a sapling spend. binding_sig should be present
         builder
@@ -1279,7 +1290,7 @@ mod tests {
                 sapling_anchor: None,
                 orchard_anchor: None,
             };
-            let builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             assert_matches!(
                 builder.mock_build(&TransparentSigningSet::new(), &[], &[], OsRng),
                 Err(Error::InsufficientFunds(expected)) if expected == MINIMUM_FEE.into()
@@ -1299,7 +1310,7 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder
                 .add_sapling_output::<Infallible>(
                     ovk,
@@ -1322,7 +1333,7 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder
                 .add_transparent_output(
                     &TransparentAddress::PublicKeyHash([0; 20]),
@@ -1344,7 +1355,7 @@ mod tests {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder.set_zip233_amount(Zatoshis::const_from_u64(50000));
 
             assert_matches!(
@@ -1370,7 +1381,7 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder
                 .add_sapling_spend::<Infallible>(
                     dfvk.fvk().clone(),
@@ -1406,7 +1417,7 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder
                 .add_sapling_spend::<Infallible>(
                     dfvk.fvk().clone(),
@@ -1451,7 +1462,7 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder
                 .add_sapling_spend::<Infallible>(
                     dfvk.fvk().clone(),
@@ -1499,7 +1510,7 @@ mod tests {
                 sapling_anchor: Some(witness1.root().into()),
                 orchard_anchor: Some(orchard::Anchor::empty_tree()),
             };
-            let mut builder = Builder::new(TEST_NETWORK, tx_height, build_config);
+            let mut builder = Builder::new(TEST_NETWORK, tx_height, DEFAULT_TX_EXPIRY_DELTA, build_config);
             builder
                 .add_sapling_spend::<Infallible>(
                     dfvk.fvk().clone(),

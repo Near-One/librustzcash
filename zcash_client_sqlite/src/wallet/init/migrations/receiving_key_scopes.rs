@@ -303,7 +303,7 @@ mod tests {
         block::BlockHash,
         transaction::{
             Transaction,
-            builder::{BuildConfig, BuildResult, Builder},
+            builder::{BuildConfig, BuildResult, Builder, DEFAULT_TX_EXPIRY_DELTA},
             fees::fixed,
         },
     };
@@ -362,6 +362,7 @@ mod tests {
         let mut builder = Builder::new(
             db_data.params.clone(),
             height,
+            DEFAULT_TX_EXPIRY_DELTA,
             BuildConfig::Standard {
                 sapling_anchor: Some(sapling::Anchor::empty_tree()),
                 orchard_anchor: None,

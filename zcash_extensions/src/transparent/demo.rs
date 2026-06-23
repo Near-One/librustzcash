@@ -486,7 +486,7 @@ mod tests {
         extensions::transparent::{self as tze, Extension, FromPayload, ToPayload},
         transaction::{
             Transaction, TransactionData, TxVersion,
-            builder::{BuildConfig, Builder},
+            builder::{BuildConfig, Builder, DEFAULT_TX_EXPIRY_DELTA},
             components::tze::{Authorized, Bundle, OutPoint, TzeIn, TzeOut},
             fees::{fixed, zip317::MINIMUM_FEE},
         },
@@ -622,6 +622,7 @@ mod tests {
             txn_builder: Builder::new(
                 FutureNetwork,
                 height,
+                DEFAULT_TX_EXPIRY_DELTA,
                 BuildConfig::Standard {
                     sapling_anchor: Some(sapling_anchor),
                     orchard_anchor: Some(orchard::Anchor::empty_tree()),

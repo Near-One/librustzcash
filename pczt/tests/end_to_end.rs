@@ -20,7 +20,7 @@ use rand_core::OsRng;
 use shardtree::{ShardTree, store::memory::MemoryShardStore};
 use zcash_note_encryption::try_note_decryption;
 use zcash_primitives::transaction::{
-    builder::{BuildConfig, Builder, PcztResult},
+    builder::{BuildConfig, Builder, DEFAULT_TX_EXPIRY_DELTA, PcztResult},
     fees::zip317,
     sighash::SignableInput,
     sighash_v5::v5_signature_hash,
@@ -82,6 +82,7 @@ fn transparent_to_orchard() {
     let mut builder = Builder::new(
         params,
         10_000_000.into(),
+        DEFAULT_TX_EXPIRY_DELTA,
         BuildConfig::Standard {
             sapling_anchor: None,
             orchard_anchor: Some(orchard::Anchor::empty_tree()),
@@ -238,6 +239,7 @@ fn transparent_p2sh_multisig_to_orchard() {
     let mut builder = Builder::new(
         params,
         10_000_000.into(),
+        DEFAULT_TX_EXPIRY_DELTA,
         BuildConfig::Standard {
             sapling_anchor: None,
             orchard_anchor: Some(orchard::Anchor::empty_tree()),
@@ -438,6 +440,7 @@ fn sapling_to_orchard() {
     let mut builder = Builder::new(
         MainNetwork,
         10_000_000.into(),
+        DEFAULT_TX_EXPIRY_DELTA,
         BuildConfig::Standard {
             sapling_anchor: Some(anchor),
             orchard_anchor: Some(orchard::Anchor::empty_tree()),
@@ -597,6 +600,7 @@ fn orchard_to_orchard() {
     let mut builder = Builder::new(
         MainNetwork,
         10_000_000.into(),
+        DEFAULT_TX_EXPIRY_DELTA,
         BuildConfig::Standard {
             sapling_anchor: None,
             orchard_anchor: Some(anchor),

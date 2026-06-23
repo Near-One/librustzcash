@@ -205,3 +205,34 @@ pub fn v5_signature_hash<
             .as_ref(),
     )
 }
+
+pub fn my_signature_hash<A: Authorization, TA: TransparentAuthorizingContext>(
+    tx: &TransactionData<A>,
+    transp_bundel: Option<transparent::Bundle<TA>>,
+    signable_input: &SignableInput<'_>,
+    txid_parts: &TxDigests<Blake2bHash>,
+) -> Blake2bHash {
+    assert_eq!(
+        tx.transparent_bundle.is_some(),
+        txid_parts.transparent_digests.is_some()
+    );
+    to_hash(
+        tx.version,
+        tx.consensus_branch_id,
+        txid_parts.header_digest,
+        transparent_sig_digest(
+            transp_bundel
+                .as_ref()
+                .zip(txid_parts.transparent_digests.as_ref()),
+            signable_input,
+        ),
+        txid_parts.sapling_digest,
+        txid_parts.orchard_digest,
+        #[cfg(zcash_unstable = "zfuture")]
+        tx.tze_bundle
+            .as_ref()
+            .zip(txid_parts.tze_digests.as_ref())
+            .map(|(bundle, tze_digests)| tze_input_sigdigests(bundle, signable_input, tze_digests))
+            .as_ref(),
+    )
+}

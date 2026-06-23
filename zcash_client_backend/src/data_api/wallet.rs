@@ -68,7 +68,7 @@ use zcash_keys::{
 };
 use zcash_primitives::transaction::{
     Transaction, TxId,
-    builder::{BuildConfig, BuildResult, Builder},
+    builder::{BuildConfig, BuildResult, Builder, DEFAULT_TX_EXPIRY_DELTA},
     components::sapling::zip212_enforcement,
     fees::FeeRule,
 };
@@ -1210,6 +1210,7 @@ where
     let mut builder = Builder::new(
         params.clone(),
         BlockHeight::from(min_target_height),
+        DEFAULT_TX_EXPIRY_DELTA,
         BuildConfig::Standard {
             sapling_anchor,
             orchard_anchor,
