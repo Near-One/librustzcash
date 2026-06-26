@@ -1330,7 +1330,7 @@ where
     let mut builder = Builder::new(
         params.clone(),
         BlockHeight::from(min_target_height),
-        50,
+        BlockHeight::from(min_target_height) + 50,
         BuildConfig::Standard {
             sapling_anchor,
             orchard_anchor,

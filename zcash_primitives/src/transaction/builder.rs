@@ -462,7 +462,7 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
     ///
     /// The expiry height will be set to the given height plus the default transaction
     /// expiry delta (20 blocks).
-    pub fn new(params: P, target_height: BlockHeight, expiry_delta: u32, build_config: BuildConfig) -> Self {
+    pub fn new(params: P, target_height: BlockHeight, expiry_height: BlockHeight, build_config: BuildConfig) -> Self {
         let orchard_builder = if params.is_nu_active(NetworkUpgrade::Nu5, target_height) {
             build_config
                 .orchard_builder_config()
@@ -480,21 +480,6 @@ impl<'a, P: consensus::Parameters> Builder<'a, P, ()> {
                     anchor,
                 )
             });
-
-        // # Consensus Rules
-        //
-        // > [NU5 onward] The `nExpiryHeight` field of a coinbase transaction MUST be equal to its
-        // > block height.
-        //
-        // ## Notes
-        //
-        // We set the expiry height for coinbase txs to the block height regardless of the network
-        // upgrade.
-        let expiry_height = if build_config.is_coinbase() {
-            target_height
-        } else {
-            target_height + expiry_delta
-        };
 
         // Determine the default transaction version for the consensus branch
         let consensus_branch_id = BranchId::for_height(&params, target_height);
