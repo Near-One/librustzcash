@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+#[cfg(feature = "orchard")]
+use std::collections::BTreeSet;
 use std::hash::Hash;
 use std::ops::Range;
 
@@ -14,10 +16,11 @@ use transparent::{address::TransparentAddress, bundle::OutPoint};
 use zcash_keys::{address::Receiver, encoding::AddressCodec as _};
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    PoolType, ShieldedProtocol,
+    PoolType, ShieldedPool,
     consensus::{self, BlockHeight},
     value::{BalanceError, Zatoshis},
 };
+use zcash_script::solver::ScriptKind;
 
 use crate::{
     TransferType,
@@ -129,6 +132,20 @@ pub enum PutBlocksError<SE, TE> {
     Storage(SE),
     /// Wraps an error produced by [`shardtree`] insertion.
     ShardTree(ShardTreeError<TE>),
+    /// Wraps an error produced by [`shardtree`] while inserting the note commitment data for a
+    /// range of scanned blocks into one of the wallet's note commitment trees. The `pool` and
+    /// `block_range` fields record the shielded pool whose note commitment tree was being updated
+    /// and the range of block heights (start-inclusive, end-exclusive) that were being added to
+    /// the wallet when the error occurred.
+    ShardTreeForBlockRange {
+        /// The shielded pool whose note commitment tree was being updated when the error occurred.
+        pool: ShieldedPool,
+        /// The range of block heights that were being added to the wallet when the error
+        /// occurred.
+        block_range: Range<BlockHeight>,
+        /// The underlying error produced by [`shardtree`] insertion.
+        error: ShardTreeError<TE>,
+    },
     #[cfg(feature = "transparent-inputs")]
     GapAddresses(GapAddressesError<SE>),
 }
@@ -196,11 +213,15 @@ impl<
 /// - `blocks`: The scanned block data to be added to the data store. This vector must contain
 ///   data for blocks in sequentially increasing height order;
 ///   [`PutBlocksError::NonSequentialBlocks`] will be returned if this invariant is violated.
+/// - `anchor_retention_height`: If `Some(h)`, checkpoints established at or above height `h` whose
+///   height falls on the [`ANCHOR_RETENTION_INTERVAL`] are retained as durable anchors, exempting
+///   them from automatic pruning of excess checkpoints. `None` disables anchor retention.
 pub fn put_blocks<DbT, SE, TE>(
     wallet_db: &mut DbT,
     #[cfg(feature = "transparent-inputs")] gap_limits: GapLimits,
     from_state: &ChainState,
     blocks: Vec<ScannedBlock<<DbT as LowLevelWalletRead>::AccountId>>,
+    anchor_retention_height: Option<BlockHeight>,
 ) -> Result<(), PutBlocksError<SE, TE>>
 where
     DbT: PutBlocksDbT<SE, TE, <DbT as LowLevelWalletRead>::AccountRef>,
@@ -222,6 +243,9 @@ where
         initial_block_sequential &= from_state.final_orchard_tree().tree_size()
             + u64::try_from(initial_block.orchard().commitments().len()).unwrap()
             == u64::from(initial_block.orchard().final_tree_size());
+        initial_block_sequential &= from_state.final_ironwood_tree().tree_size()
+            + u64::try_from(initial_block.ironwood().commitments().len()).unwrap()
+            == u64::from(initial_block.ironwood().final_tree_size());
     }
     if !initial_block_sequential {
         return Err(PutBlocksError::NonSequentialBlocks {
@@ -233,6 +257,8 @@ where
     let mut sapling_commitments = vec![];
     #[cfg(feature = "orchard")]
     let mut orchard_commitments = vec![];
+    #[cfg(feature = "orchard")]
+    let mut ironwood_commitments = vec![];
     let mut last_scanned_height = None;
     let mut note_positions = vec![];
 
@@ -262,6 +288,10 @@ where
                 block.orchard().final_tree_size(),
                 #[cfg(feature = "orchard")]
                 block.orchard().commitments().len().try_into().unwrap(),
+                #[cfg(feature = "orchard")]
+                block.ironwood().final_tree_size(),
+                #[cfg(feature = "orchard")]
+                block.ironwood().commitments().len().try_into().unwrap(),
             )
             .map_err(PutBlocksError::Storage)?;
 
@@ -286,6 +316,8 @@ where
                 tx.sapling_spends().iter().map(|spend| spend.nf()),
                 #[cfg(feature = "orchard")]
                 tx.orchard_spends().iter().map(|spend| spend.nf()),
+                #[cfg(feature = "orchard")]
+                tx.ironwood_spends().iter().map(|spend| spend.nf()),
             )
             .map_err(PutBlocksError::Storage)?;
 
@@ -346,6 +378,34 @@ where
                 |_account_id| (),
             )
             .map_err(PutBlocksError::Storage)?;
+
+            #[cfg(feature = "orchard")]
+            put_shielded_outputs(
+                wallet_db,
+                params,
+                tx_ref,
+                None,
+                tx.ironwood_outputs(),
+                // Check whether this note was spent in a later block range that
+                // we previously scanned.
+                |wallet_db, output| {
+                    Ok(output
+                        .nf()
+                        .map(|nf| wallet_db.detect_ironwood_spend(nf))
+                        .transpose()?
+                        .flatten())
+                },
+                |wallet_db, output, tx_ref, spent_in| {
+                    wallet_db.put_received_ironwood_note(
+                        output,
+                        tx_ref,
+                        Some(block.height()),
+                        spent_in,
+                    )
+                },
+                |_account_id| (),
+            )
+            .map_err(PutBlocksError::Storage)?;
         }
 
         // Insert the new nullifiers from this block into the nullifier map.
@@ -358,20 +418,28 @@ where
             .track_block_orchard_nullifiers(block.height(), block.orchard().nullifier_map())
             .map_err(PutBlocksError::Storage)?;
 
+        #[cfg(feature = "orchard")]
+        wallet_db
+            .track_block_ironwood_nullifiers(block.height(), block.ironwood().nullifier_map())
+            .map_err(PutBlocksError::Storage)?;
+
         note_positions.extend(block.transactions().iter().flat_map(|wtx| {
-            let iter = wtx.sapling_outputs().iter().map(|out| {
-                (
-                    ShieldedProtocol::Sapling,
-                    out.note_commitment_tree_position(),
-                )
-            });
+            let iter = wtx
+                .sapling_outputs()
+                .iter()
+                .map(|out| (ShieldedPool::Sapling, out.note_commitment_tree_position()));
             #[cfg(feature = "orchard")]
-            let iter = iter.chain(wtx.orchard_outputs().iter().map(|out| {
-                (
-                    ShieldedProtocol::Orchard,
-                    out.note_commitment_tree_position(),
-                )
-            }));
+            let iter = iter.chain(
+                wtx.orchard_outputs()
+                    .iter()
+                    .map(|out| (ShieldedPool::Orchard, out.note_commitment_tree_position())),
+            );
+            #[cfg(feature = "orchard")]
+            let iter = iter.chain(
+                wtx.ironwood_outputs()
+                    .iter()
+                    .map(|out| (ShieldedPool::Ironwood, out.note_commitment_tree_position())),
+            );
 
             iter
         }));
@@ -401,6 +469,8 @@ where
         sapling_commitments.extend(block_commitments.sapling.into_iter().map(Some));
         #[cfg(feature = "orchard")]
         orchard_commitments.extend(block_commitments.orchard.into_iter().map(Some));
+        #[cfg(feature = "orchard")]
+        ironwood_commitments.extend(block_commitments.ironwood.into_iter().map(Some));
     }
 
     #[cfg(feature = "transparent-inputs")]
@@ -444,21 +514,49 @@ where
             CHUNK_SIZE,
         );
 
-        // Ensure that we have the same set of checkpoints across all trees.
+        // The Ironwood note commitment tree is Orchard-shaped and so uses the Orchard shard
+        // height, but is a distinct pool with its own tree.
         #[cfg(feature = "orchard")]
-        let (missing_sapling_checkpoints, missing_orchard_checkpoints) = {
+        let ironwood_subtrees = build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
+            Position::from(from_state.final_ironwood_tree().tree_size()),
+            &mut ironwood_commitments,
+            CHUNK_SIZE,
+        );
+
+        // Ensure that we have the same set of checkpoints across all trees. Each tree must gain a
+        // checkpoint at every height that is checkpointed in any of the other trees, so the set of
+        // heights to ensure for a given tree is the union of the checkpoint heights of the others.
+        #[cfg(feature = "orchard")]
+        let (
+            missing_sapling_checkpoints,
+            missing_orchard_checkpoints,
+            missing_ironwood_checkpoints,
+        ) = {
             let sapling_checkpoint_positions = checkpoint_positions(&sapling_subtrees);
             let orchard_checkpoint_positions = checkpoint_positions(&orchard_subtrees);
+            let ironwood_checkpoint_positions = checkpoint_positions(&ironwood_subtrees);
+
+            let [ensure_sapling, ensure_orchard, ensure_ironwood] = cross_pool_ensure_heights(
+                &sapling_checkpoint_positions.keys().copied().collect(),
+                &orchard_checkpoint_positions.keys().copied().collect(),
+                &ironwood_checkpoint_positions.keys().copied().collect(),
+            );
+
             (
                 ensure_checkpoints(
-                    orchard_checkpoint_positions.keys(),
+                    ensure_sapling.iter(),
                     &sapling_checkpoint_positions,
                     from_state.final_sapling_tree(),
                 ),
                 ensure_checkpoints(
-                    sapling_checkpoint_positions.keys(),
+                    ensure_orchard.iter(),
                     &orchard_checkpoint_positions,
                     from_state.final_orchard_tree(),
+                ),
+                ensure_checkpoints(
+                    ensure_ironwood.iter(),
+                    &ironwood_checkpoint_positions,
+                    from_state.final_ironwood_tree(),
                 ),
             )
         };
@@ -474,11 +572,16 @@ where
                     from_state.final_sapling_tree(),
                     from_state.block_height(),
                     sapling_tree,
+                    anchor_retention_height,
                     &mut sapling_subtrees,
                     #[cfg(feature = "orchard")]
                     &mut missing_checkpoints,
                 )
-                .map_err(PutBlocksError::ShardTree)
+                .map_err(|error| PutBlocksError::ShardTreeForBlockRange {
+                    pool: ShieldedPool::Sapling,
+                    block_range: from_state.block_height()..(last_scanned_height + 1),
+                    error,
+                })
             })?;
         }
 
@@ -493,10 +596,38 @@ where
                     from_state.final_orchard_tree(),
                     from_state.block_height(),
                     orchard_tree,
+                    anchor_retention_height,
                     &mut orchard_subtrees,
                     &mut missing_checkpoints,
                 )
-                .map_err(PutBlocksError::ShardTree)
+                .map_err(|error| PutBlocksError::ShardTreeForBlockRange {
+                    pool: ShieldedPool::Orchard,
+                    block_range: from_state.block_height()..(last_scanned_height + 1),
+                    error,
+                })
+            })?;
+        }
+
+        // Update the Ironwood note commitment tree with all newly read note commitments
+        #[cfg(feature = "orchard")]
+        {
+            let mut ironwood_subtrees = ironwood_subtrees.into_iter();
+            let mut missing_checkpoints = missing_ironwood_checkpoints.into_iter();
+            wallet_db.with_ironwood_tree_mut(|ironwood_tree| {
+                update_tree(
+                    "Ironwood",
+                    from_state.final_ironwood_tree(),
+                    from_state.block_height(),
+                    ironwood_tree,
+                    anchor_retention_height,
+                    &mut ironwood_subtrees,
+                    &mut missing_checkpoints,
+                )
+                .map_err(|error| PutBlocksError::ShardTreeForBlockRange {
+                    pool: ShieldedPool::Ironwood,
+                    block_range: from_state.block_height()..(last_scanned_height + 1),
+                    error,
+                })
             })?;
         }
 
@@ -658,6 +789,12 @@ where
             .iter()
             .flat_map(|b| b.actions().iter())
             .map(|action| action.nullifier()),
+        #[cfg(feature = "orchard")]
+        d_tx.tx()
+            .ironwood_bundle()
+            .iter()
+            .flat_map(|b| b.actions().iter())
+            .map(|action| action.nullifier()),
     )?;
 
     // A flag used to determine whether it is necessary to query for transactions that
@@ -672,6 +809,7 @@ where
         #[cfg(feature = "orchard")]
         {
             tx_has_wallet_outputs |= !d_tx.orchard_outputs().is_empty();
+            tx_has_wallet_outputs |= !d_tx.ironwood_outputs().is_empty();
         }
 
         // Two cases handled here:
@@ -713,6 +851,25 @@ where
         |_, _| Ok(None),
         |wallet_db, output, tx_ref, spent_in| {
             wallet_db.put_received_orchard_note(output, tx_ref, d_tx.mined_height(), spent_in)
+        },
+        |_account_id| {
+            #[cfg(feature = "transparent-inputs")]
+            gap_update_set.insert((_account_id, TransparentKeyScope::EXTERNAL));
+        },
+    )?;
+
+    // Ironwood outputs are Orchard-shaped but belong to a distinct pool; store them in the
+    // Ironwood tables rather than misfiling them alongside Orchard notes.
+    #[cfg(feature = "orchard")]
+    put_shielded_outputs(
+        wallet_db,
+        Some(params),
+        tx_ref,
+        funding_account,
+        d_tx.ironwood_outputs(),
+        |_, _| Ok(None),
+        |wallet_db, output, tx_ref, spent_in| {
+            wallet_db.put_received_ironwood_note(output, tx_ref, d_tx.mined_height(), spent_in)
         },
         |_account_id| {
             #[cfg(feature = "transparent-inputs")]
@@ -869,12 +1026,17 @@ where
                 }
             }
         } else if let Some(script_kind) = script_kind {
-            warn!(
-                "Ignoring unsupported script kind '{}' for tx {} output {}",
-                script_kind.as_str(),
-                tx.txid(),
-                output_index
-            );
+            // `OP_RETURN` (nulldata) outputs are provably-unspendable data carriers with
+            // no recipient address; they are never wallet outputs, so skip them silently
+            // rather than reporting them as unsupported.
+            if !matches!(script_kind, ScriptKind::NullData { .. }) {
+                warn!(
+                    "Ignoring unsupported script kind '{}' for tx {} output {}",
+                    script_kind.as_str(),
+                    tx.txid(),
+                    output_index
+                );
+            }
         } else {
             warn!(
                 "Unable to determine recipient address for tx {} output {}",
@@ -895,6 +1057,7 @@ fn mark_notes_spent<'a, DbT>(
     >,
     sapling_nfs: impl Iterator<Item = &'a sapling::Nullifier>,
     #[cfg(feature = "orchard")] orchard_nfs: impl Iterator<Item = &'a orchard::note::Nullifier>,
+    #[cfg(feature = "orchard")] ironwood_nfs: impl Iterator<Item = &'a orchard::note::Nullifier>,
 ) -> Result<(), <DbT as LowLevelWalletRead>::Error>
 where
     DbT: LowLevelWalletWrite,
@@ -914,6 +1077,12 @@ where
     #[cfg(feature = "orchard")]
     for nf in orchard_nfs {
         wallet_db.mark_orchard_note_spent(nf, tx_ref)?;
+    }
+
+    // Mark Ironwood notes as spent when we observe their nullifiers.
+    #[cfg(feature = "orchard")]
+    for nf in ironwood_nfs {
+        wallet_db.mark_ironwood_note_spent(nf, tx_ref)?;
     }
 
     Ok(())
@@ -945,12 +1114,11 @@ where
     DbT: LowLevelWalletWrite,
     P: consensus::Parameters,
     Output: ReceivedShieldedOutput<AccountId = <DbT as LowLevelWalletRead>::AccountId>,
-    Output::Note: Clone,
 {
     for output in outputs {
         let sent_output = match output.transfer_type() {
             TransferType::Outgoing => {
-                let note = output.note().clone().into();
+                let note = output.to_wallet_note();
 
                 let recipient = Recipient::External {
                     recipient_address: external_address(
@@ -959,7 +1127,7 @@ where
                         output.account_id(),
                         note.receiver(),
                     )?,
-                    output_pool: Output::POOL_TYPE,
+                    output_pool: PoolType::Shielded(note.pool()),
                 };
 
                 Some((output.account_id(), recipient, note.value()))
@@ -968,7 +1136,7 @@ where
                 let spent_in = detect_note_spent_in(wallet_db, output)?;
                 put_received_note(wallet_db, output, tx_ref, spent_in)?;
 
-                let note = output.note().clone().into();
+                let note = output.to_wallet_note();
                 let value = note.value();
 
                 let recipient = Recipient::InternalAccount {
@@ -985,7 +1153,7 @@ where
                 on_external_account(output.account_id());
 
                 if let Some(account_id) = funding_account {
-                    let note = output.note().clone().into();
+                    let note = output.to_wallet_note();
                     let value = note.value();
 
                     // Even if the recipient address is external, record the send as internal.
@@ -1231,13 +1399,74 @@ fn ensure_checkpoints<'a, H, I: Iterator<Item = &'a BlockHeight>, const DEPTH: u
         .collect::<Vec<_>>()
 }
 
+/// The interval, in blocks, at which checkpoints are retained as durable "anchors" once anchor
+/// retention is active. At 75-second blocks this is roughly every 6 hours (4 per day).
+const ANCHOR_RETENTION_INTERVAL: u32 = 288;
+
+/// Returns whether the checkpoint at `height` should be retained as a durable anchor.
+///
+/// Anchor retention is active for `height` when `anchor_retention_height` is `Some` and `height`
+/// is at or above it (i.e. at or after the network upgrade that enables anchor retention), and
+/// `height` falls on the [`ANCHOR_RETENTION_INTERVAL`].
+fn should_retain_anchor(anchor_retention_height: Option<BlockHeight>, height: BlockHeight) -> bool {
+    anchor_retention_height.is_some_and(|floor| height >= floor)
+        && u32::from(height) % ANCHOR_RETENTION_INTERVAL == 0
+}
+
+/// Retains `height` as a durable anchor checkpoint when [`should_retain_anchor`] holds.
+fn retain_anchor_checkpoint<S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<S, DEPTH, SHARD_HEIGHT>,
+    anchor_retention_height: Option<BlockHeight>,
+    height: BlockHeight,
+) -> Result<(), ShardTreeError<S::Error>>
+where
+    S: ShardStore<CheckpointId = BlockHeight>,
+    S::H: Clone + PartialEq + Hashable,
+{
+    if should_retain_anchor(anchor_retention_height, height) {
+        tree.ensure_retained(height)?;
+    }
+    Ok(())
+}
+
+/// Given the checkpoint heights present in each of the three shielded pools' note commitment
+/// trees, in the order (Sapling, Orchard, Ironwood), returns for each pool the set of checkpoint
+/// heights it must ensure so that every pool ends up checkpointed at every height that is
+/// checkpointed in any pool.
+///
+/// The set returned for a given pool is the union of the checkpoint heights of the other two
+/// pools. Consequently the union of a pool's existing checkpoint heights with the heights returned
+/// for it equals the union of all three pools' checkpoint heights, so all three trees end up
+/// checkpointed at the same set of heights. When one pool has no checkpoints, the sets returned for
+/// the other two reduce to each other's heights, matching the prior two-pool behavior.
+#[cfg(feature = "orchard")]
+fn cross_pool_ensure_heights(
+    sapling: &BTreeSet<BlockHeight>,
+    orchard: &BTreeSet<BlockHeight>,
+    ironwood: &BTreeSet<BlockHeight>,
+) -> [BTreeSet<BlockHeight>; 3] {
+    let union = |a: &BTreeSet<BlockHeight>, b: &BTreeSet<BlockHeight>| {
+        a.union(b).copied().collect::<BTreeSet<BlockHeight>>()
+    };
+    [
+        union(orchard, ironwood),
+        union(sapling, ironwood),
+        union(sapling, orchard),
+    ]
+}
+
 /// Updates the given note commitment tree with all newly read note commitments starting
 /// at the block `frontier_height + 1`.
+///
+/// If `anchor_retention_height` is `Some`, every checkpoint established at or above that height
+/// whose height falls on the [`ANCHOR_RETENTION_INTERVAL`] is retained as a durable anchor (see
+/// [`retain_anchor_checkpoint`]).
 fn update_tree<S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
     protocol: &'static str,
     frontier: &Frontier<S::H, DEPTH>,
     frontier_height: BlockHeight,
     tree: &mut ShardTree<S, DEPTH, SHARD_HEIGHT>,
+    anchor_retention_height: Option<BlockHeight>,
     subtrees: impl Iterator<Item = (LocatedPrunableTree<S::H>, BTreeMap<BlockHeight, Position>)>,
     #[cfg(feature = "orchard")] missing_checkpoints: impl Iterator<Item = (BlockHeight, Checkpoint)>,
 ) -> Result<(), ShardTreeError<S::Error>>
@@ -1258,9 +1487,15 @@ where
             marking: Marking::Reference,
         },
     )?;
+    retain_anchor_checkpoint(tree, anchor_retention_height, frontier_height)?;
 
     for (subtree, checkpoints) in subtrees {
+        // Capture the checkpoint heights before the checkpoint map is consumed by `insert_tree`.
+        let checkpoint_heights = checkpoints.keys().copied().collect::<Vec<_>>();
         tree.insert_tree(subtree, checkpoints)?;
+        for height in checkpoint_heights {
+            retain_anchor_checkpoint(tree, anchor_retention_height, height)?;
+        }
     }
 
     // Ensure we have a tree checkpoint for each checkpointed block height.
@@ -1284,9 +1519,119 @@ where
                 tree.store_mut()
                     .add_checkpoint(height, checkpoint.clone())
                     .map_err(ShardTreeError::Storage)?;
+                retain_anchor_checkpoint(tree, anchor_retention_height, height)?;
             }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "orchard")]
+    use std::collections::BTreeSet;
+
+    use proptest::prelude::*;
+    use zcash_protocol::consensus::BlockHeight;
+
+    #[cfg(feature = "orchard")]
+    use super::cross_pool_ensure_heights;
+    use super::{ANCHOR_RETENTION_INTERVAL, should_retain_anchor};
+
+    #[test]
+    fn anchor_retention_gating() {
+        let interval = ANCHOR_RETENTION_INTERVAL;
+        let floor = BlockHeight::from(4 * interval);
+
+        // With no retention floor, nothing is retained, even on the interval.
+        assert!(!should_retain_anchor(None, BlockHeight::from(8 * interval)));
+
+        // On the interval and at or above the floor: retained.
+        assert!(should_retain_anchor(
+            Some(floor),
+            BlockHeight::from(4 * interval)
+        ));
+        assert!(should_retain_anchor(
+            Some(floor),
+            BlockHeight::from(8 * interval)
+        ));
+
+        // On the interval but below the floor: not retained.
+        assert!(!should_retain_anchor(
+            Some(floor),
+            BlockHeight::from(3 * interval)
+        ));
+
+        // At or above the floor but not on the interval: not retained.
+        assert!(!should_retain_anchor(
+            Some(floor),
+            BlockHeight::from(4 * interval + 1)
+        ));
+        assert!(!should_retain_anchor(
+            Some(floor),
+            BlockHeight::from(5 * interval - 1)
+        ));
+    }
+
+    #[cfg(feature = "orchard")]
+    prop_compose! {
+        /// An arbitrary set of note-commitment-tree checkpoint block heights.
+        fn arb_heights()(
+            heights in proptest::collection::vec(0u32..100, 0..20),
+        ) -> BTreeSet<BlockHeight> {
+            heights.into_iter().map(BlockHeight::from).collect()
+        }
+    }
+
+    #[cfg(feature = "orchard")]
+    fn union(a: &BTreeSet<BlockHeight>, b: &BTreeSet<BlockHeight>) -> BTreeSet<BlockHeight> {
+        a.union(b).copied().collect()
+    }
+
+    proptest! {
+        /// After reconciliation every pool is checkpointed at exactly the union of all three
+        /// pools' checkpoint heights, so the three note commitment trees end up with an identical
+        /// set of checkpoint heights. This is the invariant that keeps cross-pool rewinds
+        /// consistent.
+        #[test]
+        #[cfg(feature = "orchard")]
+        fn ensure_heights_align_all_pools(
+            sapling in arb_heights(),
+            orchard in arb_heights(),
+            ironwood in arb_heights(),
+        ) {
+            let [ensure_sapling, ensure_orchard, ensure_ironwood] =
+                cross_pool_ensure_heights(&sapling, &orchard, &ironwood);
+
+            let total = union(&union(&sapling, &orchard), &ironwood);
+
+            prop_assert_eq!(union(&sapling, &ensure_sapling), total.clone());
+            prop_assert_eq!(union(&orchard, &ensure_orchard), total.clone());
+            prop_assert_eq!(union(&ironwood, &ensure_ironwood), total);
+
+            // The heights ensured for a pool are exactly the union of the other two pools'
+            // checkpoint heights.
+            prop_assert_eq!(ensure_sapling, union(&orchard, &ironwood));
+            prop_assert_eq!(ensure_orchard, union(&sapling, &ironwood));
+            prop_assert_eq!(ensure_ironwood, union(&sapling, &orchard));
+        }
+
+        /// With no Ironwood checkpoints (the pre-Ironwood-activation reality), reconciliation of
+        /// the Sapling and Orchard trees is unchanged from the prior two-pool behavior: each
+        /// ensures the other's heights, and the empty Ironwood tree ensures the union of both.
+        #[test]
+        #[cfg(feature = "orchard")]
+        fn ensure_heights_degrade_to_two_pools(
+            sapling in arb_heights(),
+            orchard in arb_heights(),
+        ) {
+            let [ensure_sapling, ensure_orchard, ensure_ironwood] =
+                cross_pool_ensure_heights(&sapling, &orchard, &BTreeSet::new());
+
+            prop_assert_eq!(ensure_sapling, orchard.clone());
+            prop_assert_eq!(ensure_orchard, sapling.clone());
+            prop_assert_eq!(ensure_ironwood, union(&sapling, &orchard));
+        }
+    }
 }

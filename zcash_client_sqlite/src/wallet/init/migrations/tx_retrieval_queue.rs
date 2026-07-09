@@ -197,6 +197,8 @@ impl<P: consensus::Parameters> RusqliteMigration for Migration<P> {
                         vec![],
                         #[cfg(feature = "orchard")]
                         vec![],
+                        #[cfg(feature = "orchard")]
+                        vec![],
                     );
 
                     queue_transparent_input_retrieval(conn, tx_ref, &d_tx)?;
@@ -389,10 +391,7 @@ mod tests {
             BranchId::Nu5,
             0,
             12345678.into(),
-            #[cfg(all(
-                any(zcash_unstable = "nu7", zcash_unstable = "zfuture"),
-                feature = "zip-233"
-            ))]
+            #[cfg(all(zcash_unstable = "nu7", feature = "zip-233"))]
             Zatoshis::ZERO,
             Some(transparent::bundle::Bundle {
                 vin: vec![TxIn::from_parts(OutPoint::fake(), Script::default(), 0)],
